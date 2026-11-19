@@ -1,0 +1,14 @@
+Jitsi Meet iOS SDK
+Copyright 2018-present 8x8, Inc.
+Copyright 2017-2018 Atlassian Pty Ltd
+
+This product is a modified build of the Jitsi Meet iOS SDK 13.3.1
+(https://github.com/jitsi/jitsi-meet, commit 0b5dd6dd872a5a7301ab2f2cb9cdb42ad5f2b4df), licensed under the
+Apache License, Version 2.0 (LICENSE).
+
+Modified by Tutor Trellis: iOS's own picture in picture window for calls (a
+native module, a JS feature behind the ios.system-pip.enabled feature flag that
+also keeps the camera on while the window shows and gives way to the same
+person's other device, and memory fixes in react-native-webrtc's picture in
+picture renderer). The changes are the patches in patches/, applied to that
+commit before building.

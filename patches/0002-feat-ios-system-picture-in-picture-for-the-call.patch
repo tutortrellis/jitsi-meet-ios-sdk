@@ -1,0 +1,769 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tutor Trellis <noreply@tutortrellis.com>
+Date: Thu, 19 Nov 2026 13:20:36 +0000
+Subject: [PATCH 2/5] feat(ios): system picture in picture for the call
+
+JMSystemPictureInPicture drives AVKit's video call picture in picture
+(AVPictureInPictureVideoCallViewController): when the app goes to the
+background mid-call iOS shows a floating window with the participant on stage,
+which can be moved, resized and tapped to return; it closes when the app is
+active again, and when the conference ends. The window grows from and returns
+to the JitsiMeetView the call is drawn in (JitsiMeetView tells it when it moves
+into a window). It renders with react-native-webrtc's SampleBufferVideoCallView
+and takes the video's shape; while there's no video (muted, or not coming
+through) it shows the participant's initials and name instead of closing.
+
+The SystemPictureInPicture native module (setEnabled, setSource, an event when
+the window opens and closes) is driven by react/features/mobile/system-pip.
+---
+ ios/sdk/sdk.xcodeproj/project.pbxproj         |   8 +
+ ios/sdk/src/JitsiMeetView.m                   |  10 +
+ .../SystemPictureInPicture.h                  |  36 +
+ .../SystemPictureInPicture.m                  | 620 ++++++++++++++++++
+ 4 files changed, 674 insertions(+)
+ create mode 100644 ios/sdk/src/picture-in-picture/SystemPictureInPicture.h
+ create mode 100644 ios/sdk/src/picture-in-picture/SystemPictureInPicture.m
+
+diff --git a/ios/sdk/sdk.xcodeproj/project.pbxproj b/ios/sdk/sdk.xcodeproj/project.pbxproj
+index a50187197..9e82d0aa2 100644
+--- a/ios/sdk/sdk.xcodeproj/project.pbxproj
++++ b/ios/sdk/sdk.xcodeproj/project.pbxproj
+@@ -45,6 +45,8 @@
+ 		C6245F5E2053091D0040BE68 /* image-resize@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = C6245F5C2053091D0040BE68 /* image-resize@3x.png */; };
+ 		C6A34261204EF76800E062DD /* DragGestureController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6A3425E204EF76800E062DD /* DragGestureController.swift */; };
+ 		C6CC49AF207412CF000DFA42 /* PiPViewCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6CC49AE207412CF000DFA42 /* PiPViewCoordinator.swift */; };
++		7E57A0012EC5D00000000003 /* SystemPictureInPicture.m in Sources */ = {isa = PBXBuildFile; fileRef = 7E57A0012EC5D00000000002 /* SystemPictureInPicture.m */; };
++		7E57A0012EC5D00000000004 /* SystemPictureInPicture.m in Sources */ = {isa = PBXBuildFile; fileRef = 7E57A0012EC5D00000000002 /* SystemPictureInPicture.m */; };
+ 		C81E9AB925AC5AD800B134D9 /* ExternalAPI.h in Headers */ = {isa = PBXBuildFile; fileRef = C81E9AB825AC5AD800B134D9 /* ExternalAPI.h */; };
+ 		C8AFD27F2462C613000293D2 /* InfoPlistUtil.h in Headers */ = {isa = PBXBuildFile; fileRef = C8AFD27D2462C613000293D2 /* InfoPlistUtil.h */; settings = {ATTRIBUTES = (Public, ); }; };
+ 		C8AFD2802462C613000293D2 /* InfoPlistUtil.m in Sources */ = {isa = PBXBuildFile; fileRef = C8AFD27E2462C613000293D2 /* InfoPlistUtil.m */; };
+@@ -147,6 +149,8 @@
+ 		C6245F5C2053091D0040BE68 /* image-resize@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; name = "image-resize@3x.png"; path = "src/picture-in-picture/image-resize@3x.png"; sourceTree = "<group>"; };
+ 		C6A3425E204EF76800E062DD /* DragGestureController.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DragGestureController.swift; sourceTree = "<group>"; };
+ 		C6CC49AE207412CF000DFA42 /* PiPViewCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PiPViewCoordinator.swift; sourceTree = "<group>"; };
++		7E57A0012EC5D00000000001 /* SystemPictureInPicture.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SystemPictureInPicture.h; sourceTree = "<group>"; };
++		7E57A0012EC5D00000000002 /* SystemPictureInPicture.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SystemPictureInPicture.m; sourceTree = "<group>"; };
+ 		C81E9AB825AC5AD800B134D9 /* ExternalAPI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ExternalAPI.h; sourceTree = "<group>"; };
+ 		C8AFD27D2462C613000293D2 /* InfoPlistUtil.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = InfoPlistUtil.h; sourceTree = "<group>"; };
+ 		C8AFD27E2462C613000293D2 /* InfoPlistUtil.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = InfoPlistUtil.m; sourceTree = "<group>"; };
+@@ -333,6 +337,8 @@
+ 			children = (
+ 				C6A3425E204EF76800E062DD /* DragGestureController.swift */,
+ 				C6CC49AE207412CF000DFA42 /* PiPViewCoordinator.swift */,
++				7E57A0012EC5D00000000001 /* SystemPictureInPicture.h */,
++				7E57A0012EC5D00000000002 /* SystemPictureInPicture.m */,
+ 			);
+ 			path = "picture-in-picture";
+ 			sourceTree = "<group>";
+@@ -649,6 +655,7 @@
+ 				0BA13D311EE83FF8007BEF7F /* ExternalAPI.m in Sources */,
+ 				C8AFD2802462C613000293D2 /* InfoPlistUtil.m in Sources */,
+ 				C6CC49AF207412CF000DFA42 /* PiPViewCoordinator.swift in Sources */,
++				7E57A0012EC5D00000000003 /* SystemPictureInPicture.m in Sources */,
+ 				DEFC743F21B178FA00E4DD96 /* LocaleDetector.m in Sources */,
+ 				0BCA495F1EC4B6C600B793EE /* AudioMode.m in Sources */,
+ 				0BCA49611EC4B6C600B793EE /* Proximity.m in Sources */,
+@@ -679,6 +686,7 @@
+ 				DE9A014D289A9A9A00E41CBB /* ExternalAPI.m in Sources */,
+ 				DE9A014F289A9A9A00E41CBB /* InfoPlistUtil.m in Sources */,
+ 				DE9A0150289A9A9A00E41CBB /* PiPViewCoordinator.swift in Sources */,
++				7E57A0012EC5D00000000004 /* SystemPictureInPicture.m in Sources */,
+ 				DE9A0151289A9A9A00E41CBB /* LocaleDetector.m in Sources */,
+ 				DE9A0152289A9A9A00E41CBB /* AudioMode.m in Sources */,
+ 				DE9A0153289A9A9A00E41CBB /* Proximity.m in Sources */,
+diff --git a/ios/sdk/src/JitsiMeetView.m b/ios/sdk/src/JitsiMeetView.m
+index 55da90fd6..10da0b274 100644
+--- a/ios/sdk/src/JitsiMeetView.m
++++ b/ios/sdk/src/JitsiMeetView.m
+@@ -24,6 +24,7 @@
+ #import "JitsiMeetConferenceOptions+Private.h"
+ #import "JitsiMeetView+Private.h"
+ #import "ReactUtils.h"
++#import "picture-in-picture/SystemPictureInPicture.h"
+ #import <React/RCTRootView.h>
+ 
+ 
+@@ -109,6 +110,15 @@ static NSString *recordingModeToString(RecordingMode mode);
+     [[NSNotificationCenter defaultCenter] removeObserver:self];
+ }
+ 
++/**
++ * iOS's picture in picture window (when enabled) grows from and returns to the
++ * view the call is drawn in.
++ */
++- (void)didMoveToWindow {
++    [super didMoveToWindow];
++    [JMSystemPictureInPicture callViewDidMoveToWindow:self];
++}
++
+ #pragma mark API
+ 
+ - (void)join:(JitsiMeetConferenceOptions *)options {
+diff --git a/ios/sdk/src/picture-in-picture/SystemPictureInPicture.h b/ios/sdk/src/picture-in-picture/SystemPictureInPicture.h
+new file mode 100644
+index 000000000..aac116e0b
+--- /dev/null
++++ b/ios/sdk/src/picture-in-picture/SystemPictureInPicture.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright @ 2026-present Tutor Trellis
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#import <UIKit/UIKit.h>
++
++NS_ASSUME_NONNULL_BEGIN
++
++/**
++ * iOS's own picture in picture window for the call (AVKit's video call
++ * picture in picture): when the app goes to the background mid-call, a
++ * floating window keeps showing the participant on stage, which the user can
++ * move, resize and tap to come back. JS (react/features/mobile/system-pip)
++ * turns it on and says whom to show; JitsiMeetView says which view the call is
++ * drawn in, where the window grows from and returns to.
++ */
++@interface JMSystemPictureInPicture : NSObject
++
++/** A JitsiMeetView moved into or out of a window. */
+++ (void)callViewDidMoveToWindow:(UIView *)view;
++
++@end
++
++NS_ASSUME_NONNULL_END
+diff --git a/ios/sdk/src/picture-in-picture/SystemPictureInPicture.m b/ios/sdk/src/picture-in-picture/SystemPictureInPicture.m
+new file mode 100644
+index 000000000..5ba53e27f
+--- /dev/null
++++ b/ios/sdk/src/picture-in-picture/SystemPictureInPicture.m
+@@ -0,0 +1,620 @@
++/*
++ * Copyright @ 2026-present Tutor Trellis
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#import <AVKit/AVKit.h>
++
++#import <React/RCTEventEmitter.h>
++#import <React/RCTLog.h>
++#import <WebRTC/WebRTC.h>
++#import <react-native-webrtc/SampleBufferVideoCallView.h>
++#import <react-native-webrtc/WebRTCModule.h>
++
++#import "SystemPictureInPicture.h"
++
++static NSString *const kActiveChangedEvent = @"org.jitsi.meet:system-pip-active-changed";
++static NSNotificationName const kActiveChangedNotification = @"org.jitsi.meet.SystemPictureInPictureActiveChanged";
++
++/** "#RRGGBB" or "#RGB" (the avatar colours JS uses); anything else is the first avatar colour. */
++static UIColor *JMColorFromHex(id value) {
++    UIColor *fallback = [UIColor colorWithRed:0x6A / 255.0 green:0x50 / 255.0 blue:0xD3 / 255.0 alpha:1];
++
++    if (![value isKindOfClass:[NSString class]] || ![value hasPrefix:@"#"]) {
++        return fallback;
++    }
++
++    NSString *digits = [value substringFromIndex:1];
++    NSCharacterSet *notHex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
++
++    if ([digits rangeOfCharacterFromSet:notHex].location != NSNotFound) {
++        return fallback;
++    }
++    if (digits.length == 3) {
++        unichar r = [digits characterAtIndex:0], g = [digits characterAtIndex:1], b = [digits characterAtIndex:2];
++
++        digits = [NSString stringWithFormat:@"%C%C%C%C%C%C", r, r, g, g, b, b];
++    }
++    if (digits.length != 6) {
++        return fallback;
++    }
++
++    unsigned long rgb = strtoul(digits.UTF8String, NULL, 16);
++
++    return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
++                           green:((rgb >> 8) & 0xFF) / 255.0
++                            blue:(rgb & 0xFF) / 255.0
++                           alpha:1];
++}
++
++static NSString *JMString(id value) {
++    return [value isKindOfClass:[NSString class]] ? value : @"";
++}
++
++static void JMPin(UIView *view, UIView *parent) {
++    view.translatesAutoresizingMaskIntoConstraints = NO;
++    [parent addSubview:view];
++    [NSLayoutConstraint activateConstraints:@[
++        [view.leadingAnchor constraintEqualToAnchor:parent.leadingAnchor],
++        [view.trailingAnchor constraintEqualToAnchor:parent.trailingAnchor],
++        [view.topAnchor constraintEqualToAnchor:parent.topAnchor],
++        [view.bottomAnchor constraintEqualToAnchor:parent.bottomAnchor]
++    ]];
++}
++
++
++#pragma mark - The video
++
++/**
++ * RNWebRTC's sample buffer renderer (what system picture in picture can show),
++ * which also says the video's shape, for the window's.
++ */
++@interface JMPiPVideoView : SampleBufferVideoCallView
++
++@property (nonatomic, copy, nullable) void (^onSize)(CGSize size);
++
++@end
++
++@implementation JMPiPVideoView {
++    CGSize _laidOutSize;
++}
++
++/** From WebRTC's thread when the frames change size, turned the way they are meant to be seen. */
++- (void)setSize:(CGSize)size {
++    void (^onSize)(CGSize) = self.onSize;
++
++    if (onSize && size.width > 0 && size.height > 0) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            onSize(size);
++        });
++    }
++}
++
++- (void)layoutSubviews {
++    [super layoutSubviews];
++
++    // The window changed size: a turned picture's scale is worked out again on the next frame.
++    if (!CGSizeEqualToSize(self.bounds.size, _laidOutSize)) {
++        _laidOutSize = self.bounds.size;
++        [self requestScaleRecalculation];
++    }
++}
++
++@end
++
++
++#pragma mark - Who it is, while there's no video
++
++/** The participant's initials in their avatar colour, with their name below when the window is big enough. */
++@interface JMPiPPlaceholder : UIView
++
++- (void)showName:(NSString *)name initials:(NSString *)initials color:(UIColor *)color;
++
++@end
++
++@implementation JMPiPPlaceholder {
++    UIView *_circle;
++    UILabel *_initials;
++    UILabel *_name;
++}
++
++- (instancetype)initWithFrame:(CGRect)frame {
++    if (self = [super initWithFrame:frame]) {
++        self.backgroundColor = [UIColor colorWithRed:0.09 green:0.09 blue:0.1 alpha:1];
++
++        _circle = [[UIView alloc] initWithFrame:CGRectZero];
++        _circle.clipsToBounds = YES;
++
++        _initials = [[UILabel alloc] initWithFrame:CGRectZero];
++        _initials.textColor = [UIColor whiteColor];
++        _initials.textAlignment = NSTextAlignmentCenter;
++        _initials.adjustsFontSizeToFitWidth = YES;
++        _initials.minimumScaleFactor = 0.5;
++
++        _name = [[UILabel alloc] initWithFrame:CGRectZero];
++        _name.textColor = [UIColor colorWithWhite:1 alpha:0.85];
++        _name.textAlignment = NSTextAlignmentCenter;
++        _name.lineBreakMode = NSLineBreakByTruncatingTail;
++
++        [_circle addSubview:_initials];
++        [self addSubview:_circle];
++        [self addSubview:_name];
++    }
++
++    return self;
++}
++
++- (void)showName:(NSString *)name initials:(NSString *)initials color:(UIColor *)color {
++    _name.text = name;
++    _initials.text = initials;
++    _circle.backgroundColor = color;
++    [self setNeedsLayout];
++}
++
++- (void)layoutSubviews {
++    [super layoutSubviews];
++
++    CGSize size = self.bounds.size;
++    BOOL circle = _initials.text.length > 0;
++    BOOL name = _name.text.length > 0 && size.height >= 110;
++    CGFloat side = MIN(size.width, size.height);
++    CGFloat diameter = circle ? floor(MIN(side * (name ? 0.42 : 0.5), 120)) : 0;
++    CGFloat fontSize = MAX(12, MIN(16, floor((circle ? diameter : side * 0.42) * 0.24)));
++    CGFloat nameHeight = name ? ceil(fontSize * 1.3) : 0;
++    CGFloat gap = circle && name ? floor(diameter * 0.14) : 0;
++    CGFloat top = floor((size.height - diameter - gap - nameHeight) / 2);
++
++    _circle.hidden = !circle;
++    _circle.frame = CGRectMake(floor((size.width - diameter) / 2), top, diameter, diameter);
++    _circle.layer.cornerRadius = diameter / 2;
++    _initials.font = [UIFont systemFontOfSize:MAX(1, floor(diameter * 0.4)) weight:UIFontWeightSemibold];
++    _initials.frame = CGRectInset(_circle.bounds, floor(diameter * 0.12), 0);
++
++    _name.hidden = !name;
++    _name.font = [UIFont systemFontOfSize:fontSize weight:UIFontWeightMedium];
++    _name.frame = CGRectMake(12, top + diameter + gap, MAX(0, size.width - 24), nameHeight);
++}
++
++@end
++
++
++#pragma mark - The window
++
++@interface JMSystemPictureInPicture () <AVPictureInPictureControllerDelegate>
++
+++ (instancetype)sharedInstance;
++
++- (void)setEnabled:(BOOL)enabled;
++- (void)updateWithSource:(nullable NSDictionary *)source
++                   track:(nullable RTCVideoTrack *)track
++                   queue:(nullable dispatch_queue_t)queue;
++
++@end
++
++@implementation JMSystemPictureInPicture {
++    /** The JitsiMeetView the call is drawn in. */
++    __weak UIView *_callView;
++    BOOL _enabled;
++    /** Someone to show (a remote participant), so the window may open. */
++    BOOL _hasSource;
++    BOOL _showVideo;
++    BOOL _active;
++    NSString *_name;
++    NSString *_initials;
++    UIColor *_color;
++    /** The video to show, and the one the window's renderer is attached to now. */
++    RTCVideoTrack *_track;
++    RTCVideoTrack *_renderedTrack;
++    JMPiPVideoView *_renderedInto;
++    /** WebRTCModule's worker queue: renderers are added and removed there, as RTCView does. */
++    dispatch_queue_t _trackQueue;
++    CGSize _videoSize;
++
++    AVPictureInPictureController *_pip;
++    AVPictureInPictureVideoCallViewController *_content;
++    JMPiPVideoView *_video;
++    JMPiPPlaceholder *_placeholder;
++    /** A window being closed after its call ended, kept until it has gone so it can animate away. */
++    AVPictureInPictureController *_retiring;
++}
++
+++ (instancetype)sharedInstance {
++    static JMSystemPictureInPicture *shared;
++    static dispatch_once_t once;
++
++    dispatch_once(&once, ^{
++        shared = [[JMSystemPictureInPicture alloc] init];
++    });
++
++    return shared;
++}
++
+++ (void)callViewDidMoveToWindow:(UIView *)view {
++    [[self sharedInstance] callView:view movedToWindow:view.window != nil];
++}
++
++- (instancetype)init {
++    if (self = [super init]) {
++        _name = @"";
++        _initials = @"";
++        _color = JMColorFromHex(nil);
++        // Back in the app: the call is on screen again, so the window goes.
++        [[NSNotificationCenter defaultCenter] addObserver:self
++                                                 selector:@selector(appDidBecomeActive:)
++                                                     name:UIApplicationDidBecomeActiveNotification
++                                                   object:nil];
++    }
++
++    return self;
++}
++
++- (void)callView:(UIView *)view movedToWindow:(BOOL)inWindow {
++    if (inWindow) {
++        if (_callView == view) {
++            return;
++        }
++        // A new call view (the app made another JitsiMeetView): the window grows from that one now.
++        [self teardown];
++        _callView = view;
++        [self refresh];
++    } else if (_callView == view) {
++        [self teardown];
++        _callView = nil;
++    }
++}
++
++- (void)setEnabled:(BOOL)enabled {
++    if (_enabled == enabled) {
++        return;
++    }
++    _enabled = enabled;
++    if (!enabled) {
++        _hasSource = NO;
++        _showVideo = NO;
++        _track = nil;
++        _name = @"";
++        _initials = @"";
++    }
++    [self refresh];
++}
++
++- (void)updateWithSource:(NSDictionary *)source track:(RTCVideoTrack *)track queue:(dispatch_queue_t)queue {
++    _hasSource = source != nil;
++    // Nobody left (they dropped out, or left): a window already open keeps who it showed, ready for them coming back.
++    if (source) {
++        _name = JMString(source[@"name"]);
++        _initials = JMString(source[@"initials"]);
++        _color = JMColorFromHex(source[@"color"]);
++    }
++    _showVideo = [source[@"video"] respondsToSelector:@selector(boolValue)] && [source[@"video"] boolValue] && track != nil;
++    // No video (muted, or not coming through): stop rendering it, the placeholder shows instead.
++    _track = _showVideo ? track : nil;
++    if (queue) {
++        _trackQueue = queue;
++    }
++    [self refresh];
++}
++
++/** Makes the window (once there's a call view) and brings it up to date with what to show. */
++- (void)refresh {
++    if (!_enabled) {
++        [self teardown];
++
++        return;
++    }
++    if (!_pip) {
++        [self build];
++    }
++    if (!_pip) {
++        return;
++    }
++
++    BOOL video = _showVideo && _track != nil;
++
++    _video.hidden = !video;
++    _placeholder.hidden = video;
++    [_placeholder showName:_name initials:_initials color:_color];
++    // Only with someone to show: alone in the call, leaving the app just leaves it.
++    _pip.canStartPictureInPictureAutomaticallyFromInline = _hasSource;
++    [self syncRenderer];
++}
++
++- (void)build {
++    UIView *callView = _callView;
++
++    if (!callView.window || ![AVPictureInPictureController isPictureInPictureSupported]) {
++        return;
++    }
++
++    _content = [[AVPictureInPictureVideoCallViewController alloc] init];
++    _content.view.backgroundColor = [UIColor blackColor];
++    if (_videoSize.width > 0 && _videoSize.height > 0) {
++        _content.preferredContentSize = _videoSize;
++    }
++
++    _placeholder = [[JMPiPPlaceholder alloc] initWithFrame:CGRectZero];
++    JMPin(_placeholder, _content.view);
++
++    _video = [[JMPiPVideoView alloc] initWithFrame:CGRectZero];
++    // Fitted, never cropped: the window takes the video's shape, and a shared screen must show whole.
++    _video.sampleBufferLayer.videoGravity = AVLayerVideoGravityResizeAspect;
++    __weak __typeof(self) weakSelf = self;
++    _video.onSize = ^(CGSize size) {
++        [weakSelf videoSizeChanged:size];
++    };
++    JMPin(_video, _content.view);
++
++    AVPictureInPictureControllerContentSource *source
++        = [[AVPictureInPictureControllerContentSource alloc] initWithActiveVideoCallSourceView:callView
++                                                                          contentViewController:_content];
++
++    _pip = [[AVPictureInPictureController alloc] initWithContentSource:source];
++    _pip.delegate = self;
++}
++
++- (void)teardown {
++    [self detachRenderer];
++
++    AVPictureInPictureController *pip = _pip;
++
++    _pip = nil;
++    _content = nil;
++    _video = nil;
++    _placeholder = nil;
++    _videoSize = CGSizeZero;
++
++    if (pip.isPictureInPictureActive) {
++        _retiring = pip;
++        [pip stopPictureInPicture];
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++            if (self->_retiring == pip) {
++                self->_retiring = nil;
++            }
++        });
++    }
++}
++
++/** Attach the window's renderer to the video it should show (and only while there's a window). */
++- (void)syncRenderer {
++    RTCVideoTrack *want = _video ? _track : nil;
++
++    if (want == _renderedTrack && _video == _renderedInto) {
++        return;
++    }
++
++    [self detachRenderer];
++    if (!want) {
++        return;
++    }
++
++    JMPiPVideoView *video = _video;
++
++    _renderedTrack = want;
++    _renderedInto = video;
++    // Someone else now: none of the last person's picture, and their own shape once their frames come.
++    [self flushVideo];
++    [video requestScaleRecalculation];
++    dispatch_async([self queue], ^{
++        [want addRenderer:video];
++    });
++}
++
++- (void)detachRenderer {
++    RTCVideoTrack *track = _renderedTrack;
++    JMPiPVideoView *view = _renderedInto;
++
++    _renderedTrack = nil;
++    _renderedInto = nil;
++    if (track && view) {
++        dispatch_async([self queue], ^{
++            [track removeRenderer:view];
++        });
++    }
++}
++
++- (dispatch_queue_t)queue {
++    return _trackQueue ?: dispatch_get_main_queue();
++}
++
++- (void)flushVideo {
++    AVSampleBufferDisplayLayer *layer = _video.sampleBufferLayer;
++
++    if (!layer) {
++        return;
++    }
++    if (@available(iOS 17.0, *)) {
++        [layer.sampleBufferRenderer flushWithRemovalOfDisplayedImage:YES completionHandler:nil];
++    } else {
++        [layer flushAndRemoveImage];
++    }
++}
++
++- (void)videoSizeChanged:(CGSize)size {
++    if (CGSizeEqualToSize(size, _videoSize)) {
++        return;
++    }
++    _videoSize = size;
++    // The window takes the video's shape (a phone held upright, a landscape screen...).
++    _content.preferredContentSize = size;
++    [_video requestScaleRecalculation];
++}
++
++- (void)appDidBecomeActive:(NSNotification *)notification {
++    if (_pip.isPictureInPictureActive) {
++        [_pip stopPictureInPicture];
++    }
++}
++
++- (void)notifyActive:(BOOL)active {
++    if (_active == active) {
++        return;
++    }
++    _active = active;
++    [[NSNotificationCenter defaultCenter] postNotificationName:kActiveChangedNotification
++                                                        object:self
++                                                      userInfo:@{ @"active": @(active) }];
++}
++
++#pragma mark AVPictureInPictureControllerDelegate
++
++- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
++    if (controller == _pip) {
++        _video.shouldRender = YES;
++    }
++}
++
++- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
++    if (controller == _pip) {
++        [self notifyActive:YES];
++    }
++}
++
++- (void)pictureInPictureController:(AVPictureInPictureController *)controller
++    failedToStartPictureInPictureWithError:(NSError *)error {
++    RCTLogWarn(@"[SystemPictureInPicture] Couldn't start: %@", error.localizedDescription);
++    if (controller == _pip) {
++        _video.shouldRender = NO;
++    }
++}
++
++- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
++    if (controller == _retiring) {
++        _retiring = nil;
++    }
++    if (controller == _pip) {
++        // Nothing to draw until it opens again, and no stale picture when it does.
++        _video.shouldRender = NO;
++        [self flushVideo];
++    }
++    [self notifyActive:NO];
++}
++
++- (void)pictureInPictureController:(AVPictureInPictureController *)controller
++    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler {
++    // The call's view stayed where it was: there's nothing to put back.
++    completionHandler(YES);
++}
++
++@end
++
++
++#pragma mark - The JS side
++
++/**
++ * NativeModules.SystemPictureInPicture: setEnabled(enabled) while in a
++ * conference with the feature flag on, setSource({ streamURL, video, name,
++ * initials, color } | null) for whom to show, and ACTIVE_CHANGED_EVENT
++ * ({ active }) when the window opens and closes.
++ */
++@interface JMSystemPictureInPictureModule : RCTEventEmitter
++@end
++
++@implementation JMSystemPictureInPictureModule {
++    /** Which setSource call is the latest: finding a stream's track takes a hop to WebRTC's queue. */
++    NSUInteger _generation;
++    BOOL _observing;
++}
++
++RCT_EXPORT_MODULE(SystemPictureInPicture);
++
+++ (BOOL)requiresMainQueueSetup {
++    return NO;
++}
++
++- (dispatch_queue_t)methodQueue {
++    return dispatch_get_main_queue();
++}
++
++- (instancetype)init {
++    if (self = [super init]) {
++        [[NSNotificationCenter defaultCenter] addObserver:self
++                                                 selector:@selector(activeChanged:)
++                                                     name:kActiveChangedNotification
++                                                   object:nil];
++    }
++
++    return self;
++}
++
++- (void)dealloc {
++    [[NSNotificationCenter defaultCenter] removeObserver:self];
++}
++
++- (NSDictionary *)constantsToExport {
++    return @{
++        @"ACTIVE_CHANGED_EVENT": kActiveChangedEvent,
++        @"SUPPORTED": @([AVPictureInPictureController isPictureInPictureSupported])
++    };
++}
++
++- (NSArray<NSString *> *)supportedEvents {
++    return @[ kActiveChangedEvent ];
++}
++
++- (void)startObserving {
++    _observing = YES;
++}
++
++- (void)stopObserving {
++    _observing = NO;
++}
++
++- (void)activeChanged:(NSNotification *)notification {
++    if (_observing) {
++        [self sendEventWithName:kActiveChangedEvent body:@{ @"active": notification.userInfo[@"active"] ?: @NO }];
++    }
++}
++
++RCT_EXPORT_METHOD(setEnabled:(BOOL)enabled) {
++    [[JMSystemPictureInPicture sharedInstance] setEnabled:enabled];
++}
++
++RCT_EXPORT_METHOD(setSource:(nullable NSDictionary *)source) {
++    NSUInteger generation = ++_generation;
++    NSString *streamURL = [source[@"streamURL"] isKindOfClass:[NSString class]] ? source[@"streamURL"] : nil;
++    WebRTCModule *webrtc = streamURL ? [self webRTCModule] : nil;
++
++    if (!webrtc) {
++        [[JMSystemPictureInPicture sharedInstance] updateWithSource:source track:nil queue:nil];
++
++        return;
++    }
++
++    dispatch_queue_t queue = webrtc.workerQueue;
++    __weak __typeof(self) weakSelf = self;
++
++    dispatch_async(queue, ^{
++        RTCVideoTrack *track = [webrtc streamForReactTag:streamURL].videoTracks.firstObject;
++
++        dispatch_async(dispatch_get_main_queue(), ^{
++            __typeof(self) strongSelf = weakSelf;
++
++            if (strongSelf && strongSelf->_generation == generation) {
++                [[JMSystemPictureInPicture sharedInstance] updateWithSource:source track:track queue:queue];
++            }
++        });
++    });
++}
++
++- (nullable WebRTCModule *)webRTCModule {
++    id module = [self.moduleRegistry moduleForName:"WebRTCModule"];
++
++    if (!module) {
++        module = [self.bridge moduleForName:@"WebRTCModule"];
++    }
++
++    return [module isKindOfClass:[WebRTCModule class]] ? module : nil;
++}
++
++@end

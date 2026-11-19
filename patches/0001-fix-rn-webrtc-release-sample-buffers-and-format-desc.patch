@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tutor Trellis <noreply@tutortrellis.com>
+Date: Thu, 19 Nov 2026 13:20:36 +0000
+Subject: [PATCH 1/5] fix(rn-webrtc): release sample buffers and format
+ descriptions in the PiP renderer
+
+SampleBufferVideoCallView (react-native-webrtc's renderer for iOS picture in
+picture) leaked a CMVideoFormatDescription on every frame, and the whole
+CMSampleBuffer (with its pixel buffer) on every frame the layer wasn't ready
+for. Release both, check the CoreMedia calls' results and initialise the
+sample timing's duration.
+---
+ patches/react-native-webrtc+155.0.1.patch | 71 +++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
+ create mode 100644 patches/react-native-webrtc+155.0.1.patch
+
+diff --git a/patches/react-native-webrtc+155.0.1.patch b/patches/react-native-webrtc+155.0.1.patch
+new file mode 100644
+index 000000000..b5019112a
+--- /dev/null
++++ b/patches/react-native-webrtc+155.0.1.patch
+@@ -0,0 +1,71 @@
++diff --git a/node_modules/react-native-webrtc/ios/RCTWebRTC/SampleBufferVideoCallView.m b/node_modules/react-native-webrtc/ios/RCTWebRTC/SampleBufferVideoCallView.m
++index b1a0b96..bbd6648 100644
++--- a/node_modules/react-native-webrtc/ios/RCTWebRTC/SampleBufferVideoCallView.m
+++++ b/node_modules/react-native-webrtc/ios/RCTWebRTC/SampleBufferVideoCallView.m
++@@ -93,14 +93,13 @@
++             [self.renderer flush];
++         }
++ 
++-        if (!self.renderer.readyForMoreMediaData) {
++-            return;
++-        }
++-
++-        [self recalculateScale:frame.rotation];
+++        // A frame the renderer isn't ready for is dropped, but still released.
+++        if (self.renderer.readyForMoreMediaData) {
+++            [self recalculateScale:frame.rotation];
++ 
++-        // Display the CMSampleBuffer using AVSampleBufferDisplayLayer
++-        [self.renderer enqueueSampleBuffer:sampleBuffer];
+++            // Display the CMSampleBuffer using AVSampleBufferDisplayLayer
+++            [self.renderer enqueueSampleBuffer:sampleBuffer];
+++        }
++         CFRelease(sampleBuffer);
++     });
++ }
++@@ -114,26 +113,36 @@
++         return nil;
++     }
++ 
++-    // Create a CMVideoFormatDescription
++-    CMVideoFormatDescriptionRef formatDescription;
++-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDescription);
+++    // Create a CMVideoFormatDescription (released below: one leaked per frame otherwise)
+++    CMVideoFormatDescriptionRef formatDescription = NULL;
+++    OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDescription);
+++    if (status != noErr || formatDescription == NULL) {
+++        CVPixelBufferRelease(pixelBuffer);
+++        return nil;
+++    }
++ 
++     // Create CMSampleTimingInfo
++     // Timescale is 90khz according to RTCVideoFrame.h
++     CMSampleTimingInfo timingInfo;
+++    timingInfo.duration = kCMTimeInvalid;
++     timingInfo.presentationTimeStamp = CMTimeMake(rtcVideoFrame.timeStamp, 90000);
++     timingInfo.decodeTimeStamp = CMTimeMake(rtcVideoFrame.timeStamp, 90000);
++ 
++     // Create CMSampleBuffer
++-    CMSampleBufferRef sampleBuffer;
++-    CMSampleBufferCreateForImageBuffer(
+++    CMSampleBufferRef sampleBuffer = NULL;
+++    status = CMSampleBufferCreateForImageBuffer(
++         kCFAllocatorDefault, pixelBuffer, true, nil, nil, formatDescription, &timingInfo, &sampleBuffer);
+++    CFRelease(formatDescription);
+++    CVPixelBufferRelease(pixelBuffer);
+++    if (status != noErr || sampleBuffer == NULL) {
+++        return nil;
+++    }
++ 
++     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, YES);
++-    CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
++-
++-    CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
++-    CVPixelBufferRelease(pixelBuffer);
+++    if (attachments != NULL && CFArrayGetCount(attachments) > 0) {
+++        CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+++        CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+++    }
++     return sampleBuffer;
++ }
++ 

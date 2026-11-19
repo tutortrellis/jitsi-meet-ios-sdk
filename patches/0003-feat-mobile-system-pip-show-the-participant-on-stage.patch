@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tutor Trellis <noreply@tutortrellis.com>
+Date: Thu, 19 Nov 2026 13:20:36 +0000
+Subject: [PATCH 3/5] feat(mobile/system-pip): show the participant on stage in
+ iOS's picture in picture
+
+Behind the ios.system-pip.enabled feature flag (off by default). While in a
+conference the native window is enabled and told whom to show: the participant
+on stage unless that's us (a remote screen share comes on stage by itself),
+else the dominant speaker, else the latest remote participant with video;
+never ourselves, a bot, a whiteboard or a shared video. Muted video, or video
+the bridge isn't sending, shows the participant's avatar initials and name.
+
+While the window shows, last N stays at 1 in the background instead of 0, so
+the participant on stage keeps coming.
+---
+ react/features/app/middlewares.native.ts      |   1 +
+ react/features/app/reducers.native.ts         |   1 +
+ react/features/app/types.ts                   |   2 +
+ react/features/base/flags/constants.ts        |   7 +
+ react/features/base/lastn/middleware.ts       |   6 +-
+ .../features/mobile/system-pip/actionTypes.ts |  10 ++
+ react/features/mobile/system-pip/actions.ts   |  17 +++
+ react/features/mobile/system-pip/functions.ts | 142 ++++++++++++++++++
+ react/features/mobile/system-pip/logger.ts    |   3 +
+ .../features/mobile/system-pip/middleware.ts  |  72 +++++++++
+ react/features/mobile/system-pip/reducer.ts   |  28 ++++
+ 11 files changed, 288 insertions(+), 1 deletion(-)
+ create mode 100644 react/features/mobile/system-pip/actionTypes.ts
+ create mode 100644 react/features/mobile/system-pip/actions.ts
+ create mode 100644 react/features/mobile/system-pip/functions.ts
+ create mode 100644 react/features/mobile/system-pip/logger.ts
+ create mode 100644 react/features/mobile/system-pip/middleware.ts
+ create mode 100644 react/features/mobile/system-pip/reducer.ts
+
+diff --git a/react/features/app/middlewares.native.ts b/react/features/app/middlewares.native.ts
+index cc9f8175a..fa7404cce 100644
+--- a/react/features/app/middlewares.native.ts
++++ b/react/features/app/middlewares.native.ts
+@@ -9,6 +9,7 @@ import '../mobile/external-api/middleware';
+ import '../mobile/navigation/middleware';
+ import '../mobile/permissions/middleware';
+ import '../mobile/proximity/middleware';
++import '../mobile/system-pip/middleware';
+ import '../mobile/wake-lock/middleware';
+ import '../mobile/react-native-sdk/middleware';
+ import '../share-room/middleware';
+diff --git a/react/features/app/reducers.native.ts b/react/features/app/reducers.native.ts
+index 902547b0b..1945999e3 100644
+--- a/react/features/app/reducers.native.ts
++++ b/react/features/app/reducers.native.ts
+@@ -2,6 +2,7 @@ import '../mobile/audio-mode/reducer';
+ import '../mobile/background/reducer';
+ import '../mobile/call-integration/reducer';
+ import '../mobile/external-api/reducer';
++import '../mobile/system-pip/reducer';
+ import '../share-room/reducer';
+ import '../time-timer/reducer';
+ 
+diff --git a/react/features/app/types.ts b/react/features/app/types.ts
+index e95ffaf3a..380019a4f 100644
+--- a/react/features/app/types.ts
++++ b/react/features/app/types.ts
+@@ -54,6 +54,7 @@ import { IMobileAudioModeState } from '../mobile/audio-mode/reducer';
+ import { IMobileBackgroundState } from '../mobile/background/reducer';
+ import { ICallIntegrationState } from '../mobile/call-integration/reducer';
+ import { IMobileExternalApiState } from '../mobile/external-api/reducer';
++import { ISystemPipState } from '../mobile/system-pip/reducer';
+ import { IMultiScreenState } from '../multi-screen/reducer';
+ import { INoAudioSignalState } from '../no-audio-signal/reducer';
+ import { INoiseDetectionState } from '../noise-detection/reducer';
+@@ -148,6 +149,7 @@ export interface IReduxState {
+     'features/mobile/audio-mode': IMobileAudioModeState;
+     'features/mobile/background': IMobileBackgroundState;
+     'features/mobile/external-api': IMobileExternalApiState;
++    'features/mobile/system-pip': ISystemPipState;
+     'features/multi-screen': IMultiScreenState;
+     'features/no-audio-signal': INoAudioSignalState;
+     'features/noise-detection': INoiseDetectionState;
+diff --git a/react/features/base/flags/constants.ts b/react/features/base/flags/constants.ts
+index 50bfa052d..476f7cc11 100644
+--- a/react/features/base/flags/constants.ts
++++ b/react/features/base/flags/constants.ts
+@@ -108,6 +108,13 @@ export const IOS_RECORDING_ENABLED = 'ios.recording.enabled';
+  */
+ export const IOS_SCREENSHARING_ENABLED = 'ios.screensharing.enabled';
+ 
++/**
++ * Flag indicating if iOS's own picture in picture window should show the
++ * participant on stage when the app goes to the background during a call.
++ * Default: disabled (false).
++ */
++export const IOS_SYSTEM_PIP_ENABLED = 'ios.system-pip.enabled';
++
+ /**
+  * Flag indicating if screen sharing should be enabled in android.
+  * Default: enabled (true).
+diff --git a/react/features/base/lastn/middleware.ts b/react/features/base/lastn/middleware.ts
+index 1f9755f51..052fbdd78 100644
+--- a/react/features/base/lastn/middleware.ts
++++ b/react/features/base/lastn/middleware.ts
+@@ -3,6 +3,7 @@ import { debounce } from 'lodash-es';
+ import { IStore } from '../../app/types';
+ import { SET_FILMSTRIP_ENABLED } from '../../filmstrip/actionTypes';
+ import { APP_STATE_CHANGED } from '../../mobile/background/actionTypes';
++import { SYSTEM_PIP_ACTIVE_CHANGED } from '../../mobile/system-pip/actionTypes';
+ import {
+     SET_CAR_MODE,
+     VIRTUAL_SCREENSHARE_REMOTE_PARTICIPANTS_UPDATED
+@@ -34,6 +35,7 @@ const _updateLastN = debounce(({ dispatch, getState }: IStore) => {
+ 
+     const { enabled: audioOnly } = state['features/base/low-bandwidth-mode'];
+     const { appState } = state['features/mobile/background'] || {};
++    const { active: systemPipActive } = state['features/mobile/system-pip'] || {};
+     const { enabled: filmStripEnabled } = state['features/filmstrip'];
+     const config = state['features/base/config'];
+     const { carMode } = state['features/video-layout'];
+@@ -47,7 +49,8 @@ const _updateLastN = debounce(({ dispatch, getState }: IStore) => {
+     // Because this is shared, on web appState is always undefined,
+     // meaning that it is never active
+     if (navigator.product === 'ReactNative' && (appState !== 'active' || carMode)) {
+-        lastNSelected = 0;
++        // In the background nothing is shown, unless iOS's picture in picture window shows the one on stage.
++        lastNSelected = systemPipActive && !carMode ? 1 : 0;
+     } else if (audioOnly) {
+         const { remoteScreenShares, tileViewEnabled } = state['features/video-layout'];
+         const largeVideoParticipantId = state['features/large-video'].participantId;
+@@ -83,6 +86,7 @@ MiddlewareRegistry.register(store => next => action => {
+     case SET_LOW_BANDWIDTH_MODE:
+     case SET_CAR_MODE:
+     case SET_FILMSTRIP_ENABLED:
++    case SYSTEM_PIP_ACTIVE_CHANGED:
+     case VIRTUAL_SCREENSHARE_REMOTE_PARTICIPANTS_UPDATED:
+         _updateLastN(store);
+         break;
+diff --git a/react/features/mobile/system-pip/actionTypes.ts b/react/features/mobile/system-pip/actionTypes.ts
+new file mode 100644
+index 000000000..02ca15e37
+--- /dev/null
++++ b/react/features/mobile/system-pip/actionTypes.ts
+@@ -0,0 +1,10 @@
++/**
++ * The type of redux action which records whether iOS's own picture in picture
++ * window is showing the call (the app is in the background).
++ *
++ * {
++ *     type: SYSTEM_PIP_ACTIVE_CHANGED,
++ *     active: boolean
++ * }
++ */
++export const SYSTEM_PIP_ACTIVE_CHANGED = 'SYSTEM_PIP_ACTIVE_CHANGED';
+diff --git a/react/features/mobile/system-pip/actions.ts b/react/features/mobile/system-pip/actions.ts
+new file mode 100644
+index 000000000..c48c25f42
+--- /dev/null
++++ b/react/features/mobile/system-pip/actions.ts
+@@ -0,0 +1,17 @@
++import { SYSTEM_PIP_ACTIVE_CHANGED } from './actionTypes';
++
++/**
++ * Records whether iOS's own picture in picture window is showing the call.
++ *
++ * @param {boolean} active - Whether the window is showing.
++ * @returns {{
++ *     type: SYSTEM_PIP_ACTIVE_CHANGED,
++ *     active: boolean
++ * }}
++ */
++export function systemPipActiveChanged(active: boolean) {
++    return {
++        type: SYSTEM_PIP_ACTIVE_CHANGED,
++        active
++    };
++}
+diff --git a/react/features/mobile/system-pip/functions.ts b/react/features/mobile/system-pip/functions.ts
+new file mode 100644
+index 000000000..d77d94f59
+--- /dev/null
++++ b/react/features/mobile/system-pip/functions.ts
+@@ -0,0 +1,142 @@
++import { NativeModules, Platform } from 'react-native';
++
++import { IReduxState } from '../../app/types';
++import { getAvatarColor, getInitials } from '../../base/avatar/functions';
++import { IOS_SYSTEM_PIP_ENABLED } from '../../base/flags/constants';
++import { getFeatureFlag } from '../../base/flags/functions';
++import { JitsiTrackStreamingStatus } from '../../base/lib-jitsi-meet';
++import { VIDEO_TYPE } from '../../base/media/constants';
++import {
++    getDominantSpeakerParticipant,
++    getParticipantById,
++    getParticipantDisplayName,
++    getRemoteParticipants,
++    isRemoteScreenshareParticipant,
++    isScreenShareParticipant
++} from '../../base/participants/functions';
++import { IParticipant } from '../../base/participants/types';
++import { getVideoTrackByParticipant } from '../../base/tracks/functions';
++
++/**
++ * What iOS's picture in picture window shows: the participant's video while it
++ * comes through, otherwise who they are.
++ */
++export interface ISystemPipSource {
++
++    /**
++     * Their avatar colour, as the call's avatars have it.
++     */
++    color: string;
++
++    /**
++     * Their initials, as the call's avatars have them.
++     */
++    initials: string;
++
++    /**
++     * Their name.
++     */
++    name: string;
++
++    /**
++     * The video's stream (react-native-webrtc's stream URL), while it comes
++     * through.
++     */
++    streamURL?: string;
++
++    /**
++     * Whether there's video to show.
++     */
++    video: boolean;
++}
++
++/**
++ * Whether iOS's own picture in picture window is in use: iOS only, on devices
++ * that have it, and only when the app asks for it with the feature flag.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {boolean}
++ */
++export function isSystemPipEnabled(state: IReduxState): boolean {
++    return Platform.OS === 'ios'
++        && Boolean(NativeModules.SystemPictureInPicture?.SUPPORTED)
++        && Boolean(getFeatureFlag(state, IOS_SYSTEM_PIP_ENABLED, false));
++}
++
++/**
++ * Whether a participant can be the one in the window: someone else (or what
++ * they share), never us, a bot, a whiteboard or a shared video.
++ *
++ * @param {IParticipant|undefined} participant - The participant.
++ * @returns {boolean}
++ */
++function isShowable(participant?: IParticipant): participant is IParticipant {
++    return Boolean(participant
++        && !participant.local
++        && !participant.botType
++        && (!participant.fakeParticipant || isRemoteScreenshareParticipant(participant)));
++}
++
++/**
++ * Who the window shows: the participant on stage (what they share comes on
++ * stage by itself) unless that's us; otherwise the dominant speaker, else the
++ * latest to join with video, else the latest to join.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {IParticipant|undefined}
++ */
++function getSystemPipParticipant(state: IReduxState): IParticipant | undefined {
++    const { participantId } = state['features/large-video'];
++    const onStage = participantId ? getParticipantById(state, participantId) : undefined;
++
++    if (isShowable(onStage)) {
++        return onStage;
++    }
++
++    const speaker = getDominantSpeakerParticipant(state);
++
++    if (isShowable(speaker)) {
++        return speaker;
++    }
++
++    const others = [ ...getRemoteParticipants(state).values() ].filter(isShowable);
++    const withVideo = others.filter(p => getVideoTrackByParticipant(state, p));
++
++    return withVideo[withVideo.length - 1] ?? others[others.length - 1];
++}
++
++/**
++ * What the window should show now, or undefined when there's nobody else in
++ * the call.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {ISystemPipSource|undefined}
++ */
++export function getSystemPipSource(state: IReduxState): ISystemPipSource | undefined {
++    const participant = getSystemPipParticipant(state);
++
++    if (!participant) {
++        return undefined;
++    }
++
++    const track = getVideoTrackByParticipant(state, participant);
++    const screen = isScreenShareParticipant(participant) || track?.videoType === VIDEO_TYPE.DESKTOP;
++    const { enabled: audioOnly } = state['features/base/low-bandwidth-mode'];
++
++    // Muted video, or the bridge not sending it: who they are instead (the window stays open, unlike an RTCView's).
++    const flowing = Boolean(track
++        && !track.muted
++        && track.streamingStatus !== JitsiTrackStreamingStatus.INACTIVE
++        && (!audioOnly || screen));
++    const streamURL: string | undefined = flowing ? track?.jitsiTrack?.getOriginalStream?.()?.toURL?.() : undefined;
++    const name = getParticipantDisplayName(state, participant.id);
++    const initialsBase = participant.name ?? name;
++
++    return {
++        color: getAvatarColor(initialsBase, state['features/dynamic-branding'].avatarBackgrounds ?? []),
++        initials: getInitials(initialsBase),
++        name,
++        streamURL,
++        video: Boolean(streamURL)
++    };
++}
+diff --git a/react/features/mobile/system-pip/logger.ts b/react/features/mobile/system-pip/logger.ts
+new file mode 100644
+index 000000000..7d59559ee
+--- /dev/null
++++ b/react/features/mobile/system-pip/logger.ts
+@@ -0,0 +1,3 @@
++import { getLogger } from '../../base/logging/functions';
++
++export default getLogger('mobile-app:system-pip');
+diff --git a/react/features/mobile/system-pip/middleware.ts b/react/features/mobile/system-pip/middleware.ts
+new file mode 100644
+index 000000000..2480d49a3
+--- /dev/null
++++ b/react/features/mobile/system-pip/middleware.ts
+@@ -0,0 +1,72 @@
++import { NativeEventEmitter, NativeModules } from 'react-native';
++
++import { APP_WILL_MOUNT, APP_WILL_UNMOUNT } from '../../base/app/actionTypes';
++import { getCurrentConference } from '../../base/conference/functions';
++import MiddlewareRegistry from '../../base/redux/MiddlewareRegistry';
++import StateListenerRegistry from '../../base/redux/StateListenerRegistry';
++
++import { systemPipActiveChanged } from './actions';
++import { getSystemPipSource, isSystemPipEnabled } from './functions';
++import logger from './logger';
++
++const { SystemPictureInPicture } = NativeModules;
++
++/**
++ * The subscription to the native module's "window opened / closed" event.
++ */
++let subscription: { remove: Function; } | undefined;
++
++/**
++ * Hears when iOS's picture in picture window opens and closes (the last N
++ * middleware keeps the participant on stage coming while it shows).
++ *
++ * @param {Store} store - The redux store.
++ * @returns {Function}
++ */
++MiddlewareRegistry.register(store => next => action => {
++    switch (action.type) {
++    case APP_WILL_MOUNT:
++        if (SystemPictureInPicture && !subscription) {
++            subscription = new NativeEventEmitter(SystemPictureInPicture).addListener(
++                SystemPictureInPicture.ACTIVE_CHANGED_EVENT,
++                ({ active }: { active: boolean; }) => {
++                    logger.info(`System picture in picture ${active ? 'shown' : 'closed'}`);
++                    store.dispatch(systemPipActiveChanged(active));
++                });
++        }
++        break;
++
++    case APP_WILL_UNMOUNT:
++        subscription?.remove();
++        subscription = undefined;
++        break;
++    }
++
++    return next(action);
++});
++
++/**
++ * The window is available while in a conference with the feature flag on, and
++ * goes when the conference ends (closing it if it's showing).
++ */
++StateListenerRegistry.register(
++    /* selector */ state => isSystemPipEnabled(state) && Boolean(getCurrentConference(state)),
++    /* listener */ (enabled: boolean) => {
++        logger.info(`System picture in picture ${enabled ? 'enabled' : 'disabled'}`);
++        SystemPictureInPicture?.setEnabled(enabled);
++    }
++);
++
++/**
++ * Who the window shows, kept up to date as the participant on stage, their
++ * video and their name change.
++ */
++StateListenerRegistry.register(
++    /* selector */ state => (isSystemPipEnabled(state) && getCurrentConference(state)
++        ? getSystemPipSource(state) ?? null
++        : null),
++    /* listener */ source => SystemPictureInPicture?.setSource(source),
++    {
++        deepEquals: true
++    }
++);
+diff --git a/react/features/mobile/system-pip/reducer.ts b/react/features/mobile/system-pip/reducer.ts
+new file mode 100644
+index 000000000..d75c51520
+--- /dev/null
++++ b/react/features/mobile/system-pip/reducer.ts
+@@ -0,0 +1,28 @@
++import ReducerRegistry from '../../base/redux/ReducerRegistry';
++
++import { SYSTEM_PIP_ACTIVE_CHANGED } from './actionTypes';
++
++export interface ISystemPipState {
++
++    /**
++     * Whether iOS's own picture in picture window is showing the call.
++     */
++    active: boolean;
++}
++
++const DEFAULT_STATE: ISystemPipState = {
++    active: false
++};
++
++ReducerRegistry.register<ISystemPipState>('features/mobile/system-pip',
++    (state = DEFAULT_STATE, action): ISystemPipState => {
++        switch (action.type) {
++        case SYSTEM_PIP_ACTIVE_CHANGED:
++            return {
++                ...state,
++                active: Boolean(action.active)
++            };
++        }
++
++        return state;
++    });

@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tutor Trellis <noreply@tutortrellis.com>
+Date: Thu, 19 Nov 2026 15:20:00 +0000
+Subject: [PATCH 6/6] feat(android): tell the app when its picture in picture
+ gives way to another device of ours
+
+Android's picture in picture is the app's own (it runs the activity's), so the
+rule iOS's system picture in picture follows (patch 5: the same person in the
+call on another device with its camera on; a main device never gives way to a
+second-device ticket) reaches it as an event: with the feature flag
+android.pip-give-way.enabled the SDK sends PICTURE_IN_PICTURE_GIVE_WAY_CHANGED
+(givesWay: boolean) whenever that changes in a conference. The app then doesn't
+go to picture in picture as it leaves, and leaves it if it's showing, which
+also lets the camera go off in the background as Jitsi's does.
+
+One rule for both platforms, decided where the presence identities are (the
+app's web view knows nothing of them). Without the flag nothing is sent.
+---
+ .../org/jitsi/meet/sdk/BroadcastEvent.java    |  6 ++++-
+ react/features/base/flags/constants.ts        |  9 +++++++
+ react/features/mobile/system-pip/functions.ts | 14 ++++++++++-
+ .../features/mobile/system-pip/middleware.ts  | 25 +++++++++++++++++++
+ 4 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/android/sdk/src/main/java/org/jitsi/meet/sdk/BroadcastEvent.java b/android/sdk/src/main/java/org/jitsi/meet/sdk/BroadcastEvent.java
+index 6a97671..7c36430 100644
+--- a/android/sdk/src/main/java/org/jitsi/meet/sdk/BroadcastEvent.java
++++ b/android/sdk/src/main/java/org/jitsi/meet/sdk/BroadcastEvent.java
+@@ -93,7 +93,8 @@ public class BroadcastEvent {
+         TRANSCRIPTION_CHUNK_RECEIVED("org.jitsi.meet.TRANSCRIPTION_CHUNK_RECEIVED"),
+         CUSTOM_BUTTON_PRESSED("org.jitsi.meet.CUSTOM_BUTTON_PRESSED"),
+         CONFERENCE_UNIQUE_ID_SET("org.jitsi.meet.CONFERENCE_UNIQUE_ID_SET"),
+-        RECORDING_STATUS_CHANGED("org.jitsi.meet.RECORDING_STATUS_CHANGED");
++        RECORDING_STATUS_CHANGED("org.jitsi.meet.RECORDING_STATUS_CHANGED"),
++        PICTURE_IN_PICTURE_GIVE_WAY_CHANGED("org.jitsi.meet.PICTURE_IN_PICTURE_GIVE_WAY_CHANGED");
+ 
+         private static final String CONFERENCE_BLURRED_NAME = "CONFERENCE_BLURRED";
+         private static final String CONFERENCE_FOCUSED_NAME = "CONFERENCE_FOCUSED";
+@@ -114,6 +115,7 @@ public class BroadcastEvent {
+         private static final String CUSTOM_BUTTON_PRESSED_NAME = "CUSTOM_BUTTON_PRESSED";
+         private static final String CONFERENCE_UNIQUE_ID_SET_NAME = "CONFERENCE_UNIQUE_ID_SET";
+         private static final String RECORDING_STATUS_CHANGED_NAME = "RECORDING_STATUS_CHANGED";
++        private static final String PICTURE_IN_PICTURE_GIVE_WAY_CHANGED_NAME = "PICTURE_IN_PICTURE_GIVE_WAY_CHANGED";
+ 
+         private final String action;
+ 
+@@ -174,6 +176,8 @@ public class BroadcastEvent {
+                     return CONFERENCE_UNIQUE_ID_SET;
+                 case RECORDING_STATUS_CHANGED_NAME:
+                     return RECORDING_STATUS_CHANGED;
++                case PICTURE_IN_PICTURE_GIVE_WAY_CHANGED_NAME:
++                    return PICTURE_IN_PICTURE_GIVE_WAY_CHANGED;
+             }
+ 
+             return null;
+diff --git a/react/features/base/flags/constants.ts b/react/features/base/flags/constants.ts
+index 476f7cc..e5ad51d 100644
+--- a/react/features/base/flags/constants.ts
++++ b/react/features/base/flags/constants.ts
+@@ -121,6 +121,15 @@ export const IOS_SYSTEM_PIP_ENABLED = 'ios.system-pip.enabled';
+  */
+ export const ANDROID_SCREENSHARING_ENABLED = 'android.screensharing.enabled';
+ 
++/**
++ * Flag indicating if the app should be told when its own picture in picture
++ * (Android's, which the app runs) should give way to another device of the
++ * same person in the call, by the rule iOS's system picture in picture follows
++ * (the PICTURE_IN_PICTURE_GIVE_WAY_CHANGED event, givesWay: boolean).
++ * Default: disabled (false).
++ */
++export const ANDROID_PIP_GIVE_WAY_ENABLED = 'android.pip-give-way.enabled';
++
+ /**
+  * Flag indicating if speaker statistics should be enabled.
+  * Default: enabled (true).
+diff --git a/react/features/mobile/system-pip/functions.ts b/react/features/mobile/system-pip/functions.ts
+index a4a4a2a..678b135 100644
+--- a/react/features/mobile/system-pip/functions.ts
++++ b/react/features/mobile/system-pip/functions.ts
+@@ -5,7 +5,7 @@ import { NativeModules, Platform } from 'react-native';
+ import { IReduxState } from '../../app/types';
+ import { getAvatarColor, getInitials } from '../../base/avatar/functions';
+ import { getCurrentConference } from '../../base/conference/functions';
+-import { IOS_SYSTEM_PIP_ENABLED } from '../../base/flags/constants';
++import { ANDROID_PIP_GIVE_WAY_ENABLED, IOS_SYSTEM_PIP_ENABLED } from '../../base/flags/constants';
+ import { getFeatureFlag } from '../../base/flags/functions';
+ import { JitsiTrackStreamingStatus } from '../../base/lib-jitsi-meet';
+ import { VIDEO_TYPE } from '../../base/media/constants';
+@@ -68,6 +68,18 @@ export function isSystemPipEnabled(state: IReduxState): boolean {
+         && Boolean(getFeatureFlag(state, IOS_SYSTEM_PIP_ENABLED, false));
+ }
+ 
++/**
++ * Android: whether the app is told when its own picture in picture should give
++ * way to another device of ours (givesWayToOwnOtherDevice). Android's picture
++ * in picture is the app's, so it asks for this with the feature flag.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {boolean}
++ */
++export function isGiveWayReported(state: IReduxState): boolean {
++    return Platform.OS === 'android' && Boolean(getFeatureFlag(state, ANDROID_PIP_GIVE_WAY_ENABLED, false));
++}
++
+ /**
+  * Who we are by our ticket (the JWT's context.user): the id the app gives the
+  * same person on each of their devices, and whether this is their second
+diff --git a/react/features/mobile/system-pip/middleware.ts b/react/features/mobile/system-pip/middleware.ts
+index f577b96..dd80053 100644
+--- a/react/features/mobile/system-pip/middleware.ts
++++ b/react/features/mobile/system-pip/middleware.ts
+@@ -3,11 +3,13 @@ import { NativeEventEmitter, NativeModules } from 'react-native';
+ import { IStore } from '../../app/types';
+ import { APP_WILL_MOUNT, APP_WILL_UNMOUNT } from '../../base/app/actionTypes';
+ import { CONFERENCE_LEFT } from '../../base/conference/actionTypes';
++import { getCurrentConference } from '../../base/conference/functions';
+ import { setVideoMuted } from '../../base/media/actions';
+ import { VIDEO_MUTISM_AUTHORITY } from '../../base/media/constants';
+ import MiddlewareRegistry from '../../base/redux/MiddlewareRegistry';
+ import StateListenerRegistry from '../../base/redux/StateListenerRegistry';
+ import { APP_STATE_CHANGED } from '../background/actionTypes';
++import { sendEvent } from '../external-api/functions';
+ 
+ import { SYSTEM_PIP_ACTIVE_CHANGED } from './actionTypes';
+ import { systemPipActiveChanged, systemPipCameraMultitaskingChanged, systemPipKeepCameraChanged } from './actions';
+@@ -15,6 +17,7 @@ import {
+     getLocalCameraStreamURL,
+     getSystemPipSource,
+     givesWayToOwnOtherDevice,
++    isGiveWayReported,
+     isSystemPipAllowed,
+     isSystemPipEnabled,
+     shouldKeepCameraInBackground
+@@ -137,6 +140,28 @@ StateListenerRegistry.register(
+         : 'No other device of ours with its camera on')
+ );
+ 
++/**
++ * Android: tells the app whether its own picture in picture gives way to
++ * another device of ours (the same rule as iOS's window), as the event
++ * PICTURE_IN_PICTURE_GIVE_WAY_CHANGED: while it does, the app doesn't go to
++ * picture in picture as it leaves, and leaves it if it's showing. Nothing is
++ * sent without the feature flag.
++ */
++StateListenerRegistry.register(
++    /* selector */ state => (isGiveWayReported(state)
++        ? Boolean(getCurrentConference(state)) && givesWayToOwnOtherDevice(state)
++        : undefined),
++    /* listener */ (givesWay: boolean | undefined, store) => {
++        if (typeof givesWay !== 'boolean') {
++            return;
++        }
++        logger.info(givesWay
++            ? 'Another device of ours has its camera on: no picture in picture here'
++            : 'No other device of ours with its camera on');
++        sendEvent(store, 'PICTURE_IN_PICTURE_GIVE_WAY_CHANGED', { givesWay });
++    }
++);
++
+ /**
+  * The window is available while in a conference with the feature flag on
+  * (unless another device of ours has its camera on), and goes when the

@@ -1,0 +1,517 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tutor Trellis <noreply@tutortrellis.com>
+Date: Thu, 19 Nov 2026 14:19:23 +0000
+Subject: [PATCH 4/5] feat(mobile/system-pip): keep the camera on in the
+ background while the window shows
+
+As video call apps do: when the app goes to the background and iOS's picture
+in picture window will show the call, our camera stays on, provided iOS lets
+it run meanwhile (multitasking camera access on its capture session: iOS 18+
+apps with the voip background mode, iPads with Stage Manager on an external
+display, or Apple's entitlement; react-native-webrtc asks for it with its
+enableMultitaskingCameraAccess option). The native module's
+cameraMultitasking(streamURL) asks the camera's own capture session each time
+the camera starts.
+
+Otherwise the camera goes off as the app leaves, as before, now also while
+sharing the screen (base/media kept it on then, but iOS stops it, so the
+others saw a frozen picture). If the window doesn't open, or closes while the
+app is still away, the camera goes off then. Coming back turns it on again.
+---
+ .../SystemPictureInPicture.m                  |  45 ++++++-
+ react/features/base/media/middleware.any.ts   |   7 +-
+ .../features/mobile/system-pip/actionTypes.ts |  23 ++++
+ react/features/mobile/system-pip/actions.ts   |  40 +++++-
+ react/features/mobile/system-pip/functions.ts |  47 ++++++-
+ .../features/mobile/system-pip/middleware.ts  | 125 ++++++++++++++++--
+ react/features/mobile/system-pip/reducer.ts   |  32 ++++-
+ 7 files changed, 303 insertions(+), 16 deletions(-)
+
+diff --git a/ios/sdk/src/picture-in-picture/SystemPictureInPicture.m b/ios/sdk/src/picture-in-picture/SystemPictureInPicture.m
+index 5ba53e27f..ec046009d 100644
+--- a/ios/sdk/src/picture-in-picture/SystemPictureInPicture.m
++++ b/ios/sdk/src/picture-in-picture/SystemPictureInPicture.m
+@@ -19,7 +19,9 @@
+ #import <React/RCTEventEmitter.h>
+ #import <React/RCTLog.h>
+ #import <WebRTC/WebRTC.h>
++#import <react-native-webrtc/RTCMediaStreamTrack+React.h>
+ #import <react-native-webrtc/SampleBufferVideoCallView.h>
++#import <react-native-webrtc/VideoCaptureController.h>
+ #import <react-native-webrtc/WebRTCModule.h>
+ 
+ #import "SystemPictureInPicture.h"
+@@ -514,8 +516,10 @@ static void JMPin(UIView *view, UIView *parent) {
+ /**
+  * NativeModules.SystemPictureInPicture: setEnabled(enabled) while in a
+  * conference with the feature flag on, setSource({ streamURL, video, name,
+- * initials, color } | null) for whom to show, and ACTIVE_CHANGED_EVENT
+- * ({ active }) when the window opens and closes.
++ * initials, color } | null) for whom to show, ACTIVE_CHANGED_EVENT
++ * ({ active }) when the window opens and closes, and
++ * cameraMultitasking(streamURL) for whether our camera may keep running while
++ * the window shows.
+  */
+ @interface JMSystemPictureInPictureModule : RCTEventEmitter
+ @end
+@@ -607,6 +611,43 @@ RCT_EXPORT_METHOD(setSource:(nullable NSDictionary *)source) {
+     });
+ }
+ 
++/**
++ * Whether the capture session behind our camera (the local stream streamURL)
++ * may run while the app is in the background with the window showing: iOS 16's
++ * multitasking camera access, which react-native-webrtc turns on when its
++ * enableMultitaskingCameraAccess option is set and the system allows it (from
++ * iOS 18 for apps with the voip background mode, on iPads with Stage Manager on
++ * an external display, or with Apple's entitlement). Without it iOS stops the
++ * camera as the app leaves.
++ */
++RCT_EXPORT_METHOD(cameraMultitasking:(NSString *)streamURL
++                  resolve:(RCTPromiseResolveBlock)resolve
++                  reject:(RCTPromiseRejectBlock)reject) {
++    WebRTCModule *webrtc = [streamURL isKindOfClass:[NSString class]] ? [self webRTCModule] : nil;
++
++    if (!webrtc) {
++        resolve(@NO);
++
++        return;
++    }
++
++    // Local streams and their capturers belong to WebRTCModule's worker queue.
++    dispatch_async(webrtc.workerQueue, ^{
++        BOOL enabled = NO;
++        RTCVideoTrack *track = webrtc.localStreams[streamURL].videoTracks.firstObject;
++        CaptureController *controller = track.captureController;
++
++        if (@available(iOS 16.0, *)) {
++            if ([controller isKindOfClass:[VideoCaptureController class]]) {
++                AVCaptureSession *session = ((VideoCaptureController *)controller).capturer.captureSession;
++
++                enabled = session.isMultitaskingCameraAccessSupported && session.isMultitaskingCameraAccessEnabled;
++            }
++        }
++        resolve(@(enabled));
++    });
++}
++
+ - (nullable WebRTCModule *)webRTCModule {
+     id module = [self.moduleRegistry moduleForName:"WebRTCModule"];
+ 
+diff --git a/react/features/base/media/middleware.any.ts b/react/features/base/media/middleware.any.ts
+index 3203a4e82..f7cb436c5 100644
+--- a/react/features/base/media/middleware.any.ts
++++ b/react/features/base/media/middleware.any.ts
+@@ -184,7 +184,12 @@ MiddlewareRegistry.register(store => next => action => {
+ function _appStateChanged({ dispatch, getState }: IStore, next: Function, action: AnyAction) {
+     if (navigator.product === 'ReactNative') {
+         const { appState } = action;
+-        const mute = appState !== 'active' && !isLocalVideoTrackDesktop(getState());
++        const state = getState();
++
++        // While iOS's own picture in picture window is in use it says whether the camera stays on (mobile/system-pip).
++        const { keepCamera } = state['features/mobile/system-pip'] || {};
++        const keep = typeof keepCamera === 'boolean' ? keepCamera : isLocalVideoTrackDesktop(state);
++        const mute = appState !== 'active' && !keep;
+ 
+         sendAnalytics(createTrackMutedEvent('video', 'background mode', mute));
+ 
+diff --git a/react/features/mobile/system-pip/actionTypes.ts b/react/features/mobile/system-pip/actionTypes.ts
+index 02ca15e37..baa40790c 100644
+--- a/react/features/mobile/system-pip/actionTypes.ts
++++ b/react/features/mobile/system-pip/actionTypes.ts
+@@ -8,3 +8,26 @@
+  * }
+  */
+ export const SYSTEM_PIP_ACTIVE_CHANGED = 'SYSTEM_PIP_ACTIVE_CHANGED';
++
++/**
++ * The type of redux action which records whether our camera's capture session
++ * may keep running while the window shows (iOS's multitasking camera access).
++ *
++ * {
++ *     type: SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED,
++ *     cameraMultitasking: boolean
++ * }
++ */
++export const SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED = 'SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED';
++
++/**
++ * The type of redux action which records whether our camera stays on when the
++ * app goes to the background (base/media reads it), or undefined while the
++ * window isn't in use (Jitsi's own rule then).
++ *
++ * {
++ *     type: SYSTEM_PIP_KEEP_CAMERA_CHANGED,
++ *     keepCamera: boolean | undefined
++ * }
++ */
++export const SYSTEM_PIP_KEEP_CAMERA_CHANGED = 'SYSTEM_PIP_KEEP_CAMERA_CHANGED';
+diff --git a/react/features/mobile/system-pip/actions.ts b/react/features/mobile/system-pip/actions.ts
+index c48c25f42..47ad3e7e2 100644
+--- a/react/features/mobile/system-pip/actions.ts
++++ b/react/features/mobile/system-pip/actions.ts
+@@ -1,4 +1,8 @@
+-import { SYSTEM_PIP_ACTIVE_CHANGED } from './actionTypes';
++import {
++    SYSTEM_PIP_ACTIVE_CHANGED,
++    SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED,
++    SYSTEM_PIP_KEEP_CAMERA_CHANGED
++} from './actionTypes';
+ 
+ /**
+  * Records whether iOS's own picture in picture window is showing the call.
+@@ -15,3 +19,37 @@ export function systemPipActiveChanged(active: boolean) {
+         active
+     };
+ }
++
++/**
++ * Records whether our camera may keep running while the window shows.
++ *
++ * @param {boolean} cameraMultitasking - Whether its capture session has
++ * multitasking camera access.
++ * @returns {{
++ *     type: SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED,
++ *     cameraMultitasking: boolean
++ * }}
++ */
++export function systemPipCameraMultitaskingChanged(cameraMultitasking: boolean) {
++    return {
++        type: SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED,
++        cameraMultitasking
++    };
++}
++
++/**
++ * Records whether our camera stays on when the app goes to the background.
++ *
++ * @param {?boolean} keepCamera - Whether it does; undefined while the window
++ * isn't in use.
++ * @returns {{
++ *     type: SYSTEM_PIP_KEEP_CAMERA_CHANGED,
++ *     keepCamera: ?boolean
++ * }}
++ */
++export function systemPipKeepCameraChanged(keepCamera: boolean | undefined) {
++    return {
++        type: SYSTEM_PIP_KEEP_CAMERA_CHANGED,
++        keepCamera
++    };
++}
+diff --git a/react/features/mobile/system-pip/functions.ts b/react/features/mobile/system-pip/functions.ts
+index d77d94f59..3799083b1 100644
+--- a/react/features/mobile/system-pip/functions.ts
++++ b/react/features/mobile/system-pip/functions.ts
+@@ -2,6 +2,7 @@ import { NativeModules, Platform } from 'react-native';
+ 
+ import { IReduxState } from '../../app/types';
+ import { getAvatarColor, getInitials } from '../../base/avatar/functions';
++import { getCurrentConference } from '../../base/conference/functions';
+ import { IOS_SYSTEM_PIP_ENABLED } from '../../base/flags/constants';
+ import { getFeatureFlag } from '../../base/flags/functions';
+ import { JitsiTrackStreamingStatus } from '../../base/lib-jitsi-meet';
+@@ -15,7 +16,7 @@ import {
+     isScreenShareParticipant
+ } from '../../base/participants/functions';
+ import { IParticipant } from '../../base/participants/types';
+-import { getVideoTrackByParticipant } from '../../base/tracks/functions';
++import { getLocalVideoTrack, getTrackState, getVideoTrackByParticipant } from '../../base/tracks/functions';
+ 
+ /**
+  * What iOS's picture in picture window shows: the participant's video while it
+@@ -63,6 +64,29 @@ export function isSystemPipEnabled(state: IReduxState): boolean {
+         && Boolean(getFeatureFlag(state, IOS_SYSTEM_PIP_ENABLED, false));
+ }
+ 
++/**
++ * Whether the window may open now: in a conference, with it enabled.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {boolean}
++ */
++export function isSystemPipAllowed(state: IReduxState): boolean {
++    return isSystemPipEnabled(state) && Boolean(getCurrentConference(state));
++}
++
++/**
++ * Our own camera's stream while it's on (to ask whether it may keep running
++ * in the background).
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {string|undefined}
++ */
++export function getLocalCameraStreamURL(state: IReduxState): string | undefined {
++    const track = getLocalVideoTrack(getTrackState(state));
++
++    return track && !track.muted ? track.jitsiTrack?.getOriginalStream?.()?.toURL?.() : undefined;
++}
++
+ /**
+  * Whether a participant can be the one in the window: someone else (or what
+  * they share), never us, a bot, a whiteboard or a shared video.
+@@ -140,3 +164,24 @@ export function getSystemPipSource(state: IReduxState): ISystemPipSource | undef
+         video: Boolean(streamURL)
+     };
+ }
++
++/**
++ * Whether our camera stays on when the app goes to the background, as video
++ * call apps' do: only when the window will show (it may open, with someone in
++ * it) and iOS lets the camera run meanwhile (multitasking camera access).
++ * Otherwise it goes off as the app leaves, as Jitsi's does, also while sharing
++ * the screen (iOS would stop it anyway, leaving the last picture frozen).
++ * Undefined while the window isn't in use: Jitsi's own rule then.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {boolean|undefined}
++ */
++export function shouldKeepCameraInBackground(state: IReduxState): boolean | undefined {
++    if (!isSystemPipEnabled(state) || !getCurrentConference(state)) {
++        return undefined;
++    }
++
++    return isSystemPipAllowed(state)
++        && Boolean(getSystemPipSource(state))
++        && state['features/mobile/system-pip'].cameraMultitasking;
++}
+diff --git a/react/features/mobile/system-pip/middleware.ts b/react/features/mobile/system-pip/middleware.ts
+index 2480d49a3..1f0d46720 100644
+--- a/react/features/mobile/system-pip/middleware.ts
++++ b/react/features/mobile/system-pip/middleware.ts
+@@ -1,29 +1,88 @@
+ import { NativeEventEmitter, NativeModules } from 'react-native';
+ 
++import { IStore } from '../../app/types';
+ import { APP_WILL_MOUNT, APP_WILL_UNMOUNT } from '../../base/app/actionTypes';
+-import { getCurrentConference } from '../../base/conference/functions';
++import { CONFERENCE_LEFT } from '../../base/conference/actionTypes';
++import { setVideoMuted } from '../../base/media/actions';
++import { VIDEO_MUTISM_AUTHORITY } from '../../base/media/constants';
+ import MiddlewareRegistry from '../../base/redux/MiddlewareRegistry';
+ import StateListenerRegistry from '../../base/redux/StateListenerRegistry';
++import { APP_STATE_CHANGED } from '../background/actionTypes';
+ 
+-import { systemPipActiveChanged } from './actions';
+-import { getSystemPipSource, isSystemPipEnabled } from './functions';
++import { SYSTEM_PIP_ACTIVE_CHANGED } from './actionTypes';
++import { systemPipActiveChanged, systemPipCameraMultitaskingChanged, systemPipKeepCameraChanged } from './actions';
++import {
++    getLocalCameraStreamURL,
++    getSystemPipSource,
++    isSystemPipAllowed,
++    isSystemPipEnabled,
++    shouldKeepCameraInBackground
++} from './functions';
+ import logger from './logger';
+ 
+ const { SystemPictureInPicture } = NativeModules;
+ 
++/**
++ * How long after going to the background the window has to open before our
++ * camera goes off after all (it opens as the app leaves).
++ */
++const OPEN_GRACE_MS = 3000;
++
++/**
++ * How long after the window closes in the background before our camera goes
++ * off (the window also closes on the way back into the app).
++ */
++const CLOSE_GRACE_MS = 1500;
++
+ /**
+  * The subscription to the native module's "window opened / closed" event.
+  */
+ let subscription: { remove: Function; } | undefined;
+ 
++/**
++ * A pending check of our camera in the background.
++ */
++let cameraCheck: ReturnType<typeof setTimeout> | undefined;
++
++/**
++ * Our camera was kept on as the app went to the background, for the window:
++ * once the window isn't showing and the app is still away, turn it off as
++ * Jitsi does (iOS stops a camera with no window to show it, leaving a frozen
++ * picture). Coming back into the app turns it on again (base/media).
++ *
++ * @param {Store} store - The redux store.
++ * @param {number} delay - How long to wait first.
++ * @returns {void}
++ */
++function _checkCameraInBackground({ dispatch, getState }: IStore, delay: number) {
++    clearTimeout(cameraCheck);
++    cameraCheck = setTimeout(() => {
++        cameraCheck = undefined;
++
++        const state = getState();
++        const { appState } = state['features/mobile/background'] || {};
++        const { active } = state['features/mobile/system-pip'];
++        // eslint-disable-next-line no-bitwise
++        const backgroundMuted = Boolean(state['features/base/media'].video.muted & VIDEO_MUTISM_AUTHORITY.BACKGROUND);
++
++        if (appState !== 'active' && !active && !backgroundMuted && isSystemPipEnabled(state)) {
++            logger.info('No picture in picture window in the background: camera off');
++            dispatch(setVideoMuted(true, VIDEO_MUTISM_AUTHORITY.BACKGROUND));
++        }
++    }, delay);
++}
++
+ /**
+  * Hears when iOS's picture in picture window opens and closes (the last N
+- * middleware keeps the participant on stage coming while it shows).
++ * middleware keeps the participant on stage coming while it shows), and keeps
++ * our camera on in the background only while the window shows.
+  *
+  * @param {Store} store - The redux store.
+  * @returns {Function}
+  */
+ MiddlewareRegistry.register(store => next => action => {
++    const result = next(action);
++
+     switch (action.type) {
+     case APP_WILL_MOUNT:
+         if (SystemPictureInPicture && !subscription) {
+@@ -39,10 +98,32 @@ MiddlewareRegistry.register(store => next => action => {
+     case APP_WILL_UNMOUNT:
+         subscription?.remove();
+         subscription = undefined;
++        clearTimeout(cameraCheck);
++        cameraCheck = undefined;
++        break;
++
++    case APP_STATE_CHANGED:
++        if (action.appState === 'active') {
++            clearTimeout(cameraCheck);
++            cameraCheck = undefined;
++        } else if (action.appState === 'background' && store.getState()['features/mobile/system-pip'].keepCamera) {
++            _checkCameraInBackground(store, OPEN_GRACE_MS);
++        }
++        break;
++
++    case SYSTEM_PIP_ACTIVE_CHANGED:
++        if (!action.active) {
++            _checkCameraInBackground(store, CLOSE_GRACE_MS);
++        }
++        break;
++
++    case CONFERENCE_LEFT:
++        clearTimeout(cameraCheck);
++        cameraCheck = undefined;
+         break;
+     }
+ 
+-    return next(action);
++    return result;
+ });
+ 
+ /**
+@@ -50,7 +131,7 @@ MiddlewareRegistry.register(store => next => action => {
+  * goes when the conference ends (closing it if it's showing).
+  */
+ StateListenerRegistry.register(
+-    /* selector */ state => isSystemPipEnabled(state) && Boolean(getCurrentConference(state)),
++    /* selector */ state => isSystemPipAllowed(state),
+     /* listener */ (enabled: boolean) => {
+         logger.info(`System picture in picture ${enabled ? 'enabled' : 'disabled'}`);
+         SystemPictureInPicture?.setEnabled(enabled);
+@@ -62,11 +143,37 @@ StateListenerRegistry.register(
+  * video and their name change.
+  */
+ StateListenerRegistry.register(
+-    /* selector */ state => (isSystemPipEnabled(state) && getCurrentConference(state)
+-        ? getSystemPipSource(state) ?? null
+-        : null),
++    /* selector */ state => (isSystemPipAllowed(state) ? getSystemPipSource(state) ?? null : null),
+     /* listener */ source => SystemPictureInPicture?.setSource(source),
+     {
+         deepEquals: true
+     }
+ );
++
++/**
++ * Whether our camera may keep running while the window shows, asked of its
++ * capture session each time the camera starts (a new stream).
++ */
++StateListenerRegistry.register(
++    /* selector */ state => (isSystemPipEnabled(state) ? getLocalCameraStreamURL(state) : undefined),
++    /* listener */ (streamURL: string | undefined, { dispatch }) => {
++        if (!streamURL || !SystemPictureInPicture?.cameraMultitasking) {
++            return;
++        }
++        SystemPictureInPicture.cameraMultitasking(streamURL)
++            .then((enabled: boolean) => {
++                logger.info(`Camera ${enabled ? 'may' : 'may not'} run with the window showing`);
++                dispatch(systemPipCameraMultitaskingChanged(Boolean(enabled)));
++            })
++            .catch(() => dispatch(systemPipCameraMultitaskingChanged(false)));
++    }
++);
++
++/**
++ * Whether our camera stays on when the app goes to the background (base/media
++ * reads it as the app leaves).
++ */
++StateListenerRegistry.register(
++    /* selector */ state => shouldKeepCameraInBackground(state),
++    /* listener */ (keepCamera: boolean | undefined, { dispatch }) => dispatch(systemPipKeepCameraChanged(keepCamera))
++);
+diff --git a/react/features/mobile/system-pip/reducer.ts b/react/features/mobile/system-pip/reducer.ts
+index d75c51520..033b5415d 100644
+--- a/react/features/mobile/system-pip/reducer.ts
++++ b/react/features/mobile/system-pip/reducer.ts
+@@ -1,6 +1,10 @@
+ import ReducerRegistry from '../../base/redux/ReducerRegistry';
+ 
+-import { SYSTEM_PIP_ACTIVE_CHANGED } from './actionTypes';
++import {
++    SYSTEM_PIP_ACTIVE_CHANGED,
++    SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED,
++    SYSTEM_PIP_KEEP_CAMERA_CHANGED
++} from './actionTypes';
+ 
+ export interface ISystemPipState {
+ 
+@@ -8,10 +12,24 @@ export interface ISystemPipState {
+      * Whether iOS's own picture in picture window is showing the call.
+      */
+     active: boolean;
++
++    /**
++     * Whether our camera's capture session may keep running while the window
++     * shows (iOS's multitasking camera access).
++     */
++    cameraMultitasking: boolean;
++
++    /**
++     * Whether our camera stays on when the app goes to the background (the
++     * window will show, and the camera may run meanwhile); undefined while the
++     * window isn't in use, when base/media follows Jitsi's own rule.
++     */
++    keepCamera?: boolean;
+ }
+ 
+ const DEFAULT_STATE: ISystemPipState = {
+-    active: false
++    active: false,
++    cameraMultitasking: false
+ };
+ 
+ ReducerRegistry.register<ISystemPipState>('features/mobile/system-pip',
+@@ -22,6 +40,16 @@ ReducerRegistry.register<ISystemPipState>('features/mobile/system-pip',
+                 ...state,
+                 active: Boolean(action.active)
+             };
++        case SYSTEM_PIP_CAMERA_MULTITASKING_CHANGED:
++            return {
++                ...state,
++                cameraMultitasking: Boolean(action.cameraMultitasking)
++            };
++        case SYSTEM_PIP_KEEP_CAMERA_CHANGED:
++            return {
++                ...state,
++                keepCamera: action.keepCamera
++            };
+         }
+ 
+         return state;

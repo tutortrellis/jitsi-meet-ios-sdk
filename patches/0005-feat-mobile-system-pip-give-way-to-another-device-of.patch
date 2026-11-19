@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tutor Trellis <noreply@tutortrellis.com>
+Date: Thu, 19 Nov 2026 14:23:41 +0000
+Subject: [PATCH 5/5] feat(mobile/system-pip): give way to another device of
+ ours with its camera on
+
+The window is for the device the person is using. When the same person is
+also in the call on another device (their computer, say) with its camera on,
+the window stays closed here, and closes if it's showing; once that device
+turns its camera off or leaves, the window may open again (the next time the
+app goes to the background). Our camera then goes off in the background as
+usual, since the other device is the one being watched.
+
+The same person is the same id in the ticket (the JWT's context.user.id,
+which the app gives each person per room, the same on all their devices),
+seen in each participant's presence (Prosody's presence_identity puts it
+there, so it can't be faked). A main device never gives way to one whose
+ticket says device: 'second' (a second-device link, such as a phone over the
+desk); a second device gives way to either. Above both, a device the person
+explicitly made their main one has context.user.primarySince in its ticket
+(seconds): it never gives way to a device of theirs with no such claim or an
+older one, so the latest switch wins (and that other device, if it is the
+app, gives way to it). Our other devices, and what they share, are never the
+one the window shows. Without identities in presence
+nobody is matched and the window works as before.
+---
+ react/features/mobile/system-pip/functions.ts | 151 ++++++++++++++++--
+ .../features/mobile/system-pip/middleware.ts  |  17 +-
+ 2 files changed, 155 insertions(+), 13 deletions(-)
+
+diff --git a/react/features/mobile/system-pip/functions.ts b/react/features/mobile/system-pip/functions.ts
+index 3799083..a4a4a2a 100644
+--- a/react/features/mobile/system-pip/functions.ts
++++ b/react/features/mobile/system-pip/functions.ts
+@@ -1,3 +1,5 @@
++// @ts-expect-error (as base/jwt: no types)
++import jwtDecode from 'jwt-decode';
+ import { NativeModules, Platform } from 'react-native';
+ 
+ import { IReduxState } from '../../app/types';
+@@ -9,9 +11,11 @@ import { JitsiTrackStreamingStatus } from '../../base/lib-jitsi-meet';
+ import { VIDEO_TYPE } from '../../base/media/constants';
+ import {
+     getDominantSpeakerParticipant,
++    getLocalParticipant,
+     getParticipantById,
+     getParticipantDisplayName,
+     getRemoteParticipants,
++    getVirtualScreenshareParticipantOwnerId,
+     isRemoteScreenshareParticipant,
+     isScreenShareParticipant
+ } from '../../base/participants/functions';
+@@ -65,13 +69,124 @@ export function isSystemPipEnabled(state: IReduxState): boolean {
+ }
+ 
+ /**
+- * Whether the window may open now: in a conference, with it enabled.
++ * Who we are by our ticket (the JWT's context.user): the id the app gives the
++ * same person on each of their devices, and whether this is their second
++ * device (device: 'second'), and since when they made it their main one
++ * (primarySince: an explicit switch in the app, in seconds), if they did.
++ */
++interface IOwnIdentity {
++    id?: string;
++    primarySince?: number;
++    second: boolean;
++}
++
++/**
++ * A ticket's claim to be the person's main device (context.user.primarySince:
++ * seconds; a string once it has come through presence), or undefined.
++ *
++ * @param {unknown} value - The claim as found.
++ * @returns {number|undefined}
++ */
++function claimOf(value: unknown): number | undefined {
++    const since = typeof value === 'number' || typeof value === 'string' ? Number(value) : NaN;
++
++    return Number.isFinite(since) && since > 0 ? since : undefined;
++}
++
++let ownIdentityCache: { identity: IOwnIdentity; jwt?: string; } | undefined;
++
++/**
++ * Who we are by our ticket.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {IOwnIdentity}
++ */
++function getOwnIdentity(state: IReduxState): IOwnIdentity {
++    const { jwt } = state['features/base/jwt'];
++
++    let cache = ownIdentityCache;
++
++    if (!cache || cache.jwt !== jwt) {
++        let user: { device?: unknown; id?: unknown; primarySince?: unknown; } | undefined;
++
++        try {
++            user = jwt ? (jwtDecode(jwt) as { context?: { user?: typeof user; }; }).context?.user : undefined;
++        } catch {
++            user = undefined;
++        }
++        cache = ownIdentityCache = {
++            jwt,
++            identity: {
++                id: typeof user?.id === 'string' && user.id ? user.id : undefined,
++                primarySince: claimOf(user?.primarySince),
++                second: user?.device === 'second'
++            }
++        };
++    }
++
++    return {
++        ...cache.identity,
++        id: cache.identity.id ?? getLocalParticipant(state)?.jwtId
++    };
++}
++
++/**
++ * Whether we give way to another device of ours in the call: the same person
++ * (the same id in their ticket, which the server puts in each participant's
++ * presence: Prosody's presence_identity) with their camera on. Then the window
++ * stays closed here (and closes if it's showing), since that device is where
++ * they are, and our camera goes off in the background as usual. A main device
++ * (signed in) never gives way to a second-device link (an iPhone over the
++ * desk), only to another main one, such as their computer; a second device
++ * gives way to either. Above both: a device the person made their main one
++ * (primarySince in its ticket, from the app's explicit switch) never gives way
++ * to a device of theirs with no such claim or an older one, so the latest
++ * switch wins. The claim only comes from signed tickets (ours, and the others'
++ * through Prosody's presence_identity, which no client can set). Without
++ * identities in presence nobody is matched, and the window works as before.
++ *
++ * @param {IReduxState} state - The redux state.
++ * @returns {boolean}
++ */
++export function givesWayToOwnOtherDevice(state: IReduxState): boolean {
++    const own = getOwnIdentity(state);
++
++    if (!own.id) {
++        return false;
++    }
++
++    for (const participant of getRemoteParticipants(state).values()) {
++        const context = participant.userContext;
++
++        if (participant.fakeParticipant || context?.id !== own.id || (!own.second && context?.device === 'second')) {
++            continue;
++        }
++
++        const theirs = claimOf(context?.primarySince);
++
++        if (own.primarySince !== undefined && (theirs === undefined || theirs < own.primarySince)) {
++            continue;
++        }
++
++        const track = getVideoTrackByParticipant(state, participant);
++
++        if (track && !track.muted && track.videoType !== VIDEO_TYPE.DESKTOP) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++/**
++ * Whether the window may open now: in a conference, with it enabled, unless we
++ * give way to another device of ours with its camera on.
+  *
+  * @param {IReduxState} state - The redux state.
+  * @returns {boolean}
+  */
+ export function isSystemPipAllowed(state: IReduxState): boolean {
+-    return isSystemPipEnabled(state) && Boolean(getCurrentConference(state));
++    return isSystemPipEnabled(state) && Boolean(getCurrentConference(state)) && !givesWayToOwnOtherDevice(state);
+ }
+ 
+ /**
+@@ -89,16 +204,27 @@ export function getLocalCameraStreamURL(state: IReduxState): string | undefined
+ 
+ /**
+  * Whether a participant can be the one in the window: someone else (or what
+- * they share), never us, a bot, a whiteboard or a shared video.
++ * they share), never us (on this device or another of ours), a bot, a
++ * whiteboard or a shared video.
+  *
++ * @param {IReduxState} state - The redux state.
++ * @param {string|undefined} ownId - Our id by our ticket.
+  * @param {IParticipant|undefined} participant - The participant.
+  * @returns {boolean}
+  */
+-function isShowable(participant?: IParticipant): participant is IParticipant {
+-    return Boolean(participant
+-        && !participant.local
+-        && !participant.botType
+-        && (!participant.fakeParticipant || isRemoteScreenshareParticipant(participant)));
++function isShowable(state: IReduxState, ownId: string | undefined, participant?: IParticipant): participant is IParticipant {
++    if (!participant
++            || participant.local
++            || participant.botType
++            || (participant.fakeParticipant && !isRemoteScreenshareParticipant(participant))) {
++        return false;
++    }
++
++    const person = isRemoteScreenshareParticipant(participant)
++        ? getParticipantById(state, getVirtualScreenshareParticipantOwnerId(participant.id))
++        : participant;
++
++    return !ownId || person?.userContext?.id !== ownId;
+ }
+ 
+ /**
+@@ -110,20 +236,23 @@ function isShowable(participant?: IParticipant): participant is IParticipant {
+  * @returns {IParticipant|undefined}
+  */
+ function getSystemPipParticipant(state: IReduxState): IParticipant | undefined {
++    const { id: ownId } = getOwnIdentity(state);
++    const showable = (participant?: IParticipant): participant is IParticipant =>
++        isShowable(state, ownId, participant);
+     const { participantId } = state['features/large-video'];
+     const onStage = participantId ? getParticipantById(state, participantId) : undefined;
+ 
+-    if (isShowable(onStage)) {
++    if (showable(onStage)) {
+         return onStage;
+     }
+ 
+     const speaker = getDominantSpeakerParticipant(state);
+ 
+-    if (isShowable(speaker)) {
++    if (showable(speaker)) {
+         return speaker;
+     }
+ 
+-    const others = [ ...getRemoteParticipants(state).values() ].filter(isShowable);
++    const others = [ ...getRemoteParticipants(state).values() ].filter(showable);
+     const withVideo = others.filter(p => getVideoTrackByParticipant(state, p));
+ 
+     return withVideo[withVideo.length - 1] ?? others[others.length - 1];
+diff --git a/react/features/mobile/system-pip/middleware.ts b/react/features/mobile/system-pip/middleware.ts
+index 1f0d467..f577b96 100644
+--- a/react/features/mobile/system-pip/middleware.ts
++++ b/react/features/mobile/system-pip/middleware.ts
+@@ -14,6 +14,7 @@ import { systemPipActiveChanged, systemPipCameraMultitaskingChanged, systemPipKe
+ import {
+     getLocalCameraStreamURL,
+     getSystemPipSource,
++    givesWayToOwnOtherDevice,
+     isSystemPipAllowed,
+     isSystemPipEnabled,
+     shouldKeepCameraInBackground
+@@ -127,8 +128,20 @@ MiddlewareRegistry.register(store => next => action => {
+ });
+ 
+ /**
+- * The window is available while in a conference with the feature flag on, and
+- * goes when the conference ends (closing it if it's showing).
++ * Another device of ours (the same person) has its camera on, or not any more.
++ */
++StateListenerRegistry.register(
++    /* selector */ state => isSystemPipEnabled(state) && givesWayToOwnOtherDevice(state),
++    /* listener */ (givesWay: boolean) => logger.info(givesWay
++        ? 'Another device of ours has its camera on: no picture in picture here'
++        : 'No other device of ours with its camera on')
++);
++
++/**
++ * The window is available while in a conference with the feature flag on
++ * (unless another device of ours has its camera on), and goes when the
++ * conference ends or that device turns its camera on (closing it if it's
++ * showing).
+  */
+ StateListenerRegistry.register(
+     /* selector */ state => isSystemPipAllowed(state),
